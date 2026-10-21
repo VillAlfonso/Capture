@@ -1,0 +1,15 @@
+# Credentials and local secrets
+key.dpapi
+*.dpapi
+.env
+.env.*
+!.env.example
+
+# Local environment and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+status.txt
+startup-error.txt
+*.log
