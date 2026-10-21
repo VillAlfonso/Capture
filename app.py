@@ -13,12 +13,14 @@ import threading
 import time
 import urllib.error
 
-from runtime_state import StateChannel
+from runtime_state import StateChannel, RecentEvents
 
 from core import Buffer, generate, rectangle, api_error_summary, RequestControl, RequestCancelled
 
 LOG = logging.getLogger('quiet-capture')
-LOG.addHandler(logging.NullHandler())
+RECENT_EVENTS = RecentEvents()
+LOG.addHandler(RECENT_EVENTS)
+LOG.setLevel(logging.INFO)
 
 
 def debug_error(context, error):
@@ -394,39 +396,13 @@ class App:
         while not stopped.is_set():
             with self.lock:
                 state = dict(pid=os.getpid(), running=True, active=self.active,
-                             status=self.status, busy=self.busy, debug=self.debug_mode)
+                             status=self.status, busy=self.busy, debug=False, thread_id=self.thread_id)
+            state['events'] = RECENT_EVENTS.snapshot()
             channel.write(state)
             if self.debug_mode and time.monotonic() - last_report >= 10:
                 LOG.info('LIVE: capture/typing=%s; status=%s; request=%s', 'ON' if state['active'] else 'OFF (paused)', state['status'], 'PENDING' if state['busy'] else 'NONE')
                 last_report = time.monotonic()
             stopped.wait(0.25)
-
-    def monitor_existing(self):
-        channel = StateChannel()
-        LOG.info('MONITOR ATTACHED: checking the existing app every 0.5 seconds. No second capture app is started.')
-        LOG.info('Closing this monitor does not stop the existing app. Its original hotkey behavior still applies.')
-        previous, last_report = None, 0
-        try:
-            while True:
-                state = channel.read()
-                now = time.monotonic()
-                if not state or now - state.get('heartbeat', 0) > 3:
-                    summary = 'STATE UNKNOWN: no live status heartbeat. App may have stopped or be an older version. Monitoring continues.'
-                elif not state.get('running'):
-                    summary = 'STOPPED: waiting for the background app to be launched again.'
-                else:
-                    summary = ('LIVE: capture/typing=' + ('ON' if state['active'] else 'OFF (paused)')
-                               + '; status=' + state['status']
-                               + '; request=' + ('PENDING' if state['busy'] else 'NONE')
-                               + '; Ctrl+Alt+F12=' + ('pause/cancel' if state['debug'] else 'exit/cancel'))
-                if summary != previous or now - last_report >= 10:
-                    LOG.info('%s', summary)
-                    previous, last_report = summary, now
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            LOG.info('Monitor closed; background app unchanged.')
-        finally:
-            channel.close()
 
     def run(self):
         # Physical pixel coordinates, including mixed-DPI monitors.
@@ -440,8 +416,6 @@ class App:
             raise C.WinError(C.get_last_error())
         if C.get_last_error() == 183:
             K.CloseHandle(mutex)
-            if self.debug_mode:
-                self.monitor_existing()
             return
         hooks, hotkeys = [], []
         channel, publisher = None, None
@@ -468,11 +442,7 @@ class App:
             LOG.info('HOLD Button 4 and DRAG, then RELEASE to capture; Button 5: send.')
             LOG.info('No selection rectangle appears. Side-button DOWN/UP events will appear here in debug mode.')
             LOG.info('Right Alt + keys in PyCharm: replay.')
-            if self.debug_mode:
-                LOG.info('CONTINUOUS DEBUG MODE: Ctrl+Alt+F12 pauses; Ctrl+Alt+F9 resumes/toggles pause.')
-                LOG.info('The process stays running while paused. Close this console to stop it. Release Right Alt before hotkeys.')
-            else:
-                LOG.info('Ctrl+Alt+F9: pause/resume. Ctrl+Alt+F12: exit (release Right Alt first).')
+            LOG.info('Ctrl+Alt+F9: enable/pause. Ctrl+Alt+F12: pause and cancel. Use stop.cmd to exit.')
             message = W.MSG()
             while True:
                 result = U.GetMessageW(C.byref(message), None, 0, 0)
@@ -483,13 +453,10 @@ class App:
                 if message.message == 0x312:
                     if message.wParam == 2:
                         self.cancel_pending()
-                        if self.debug_mode:
-                            self.active = False
-                            self.clear()
-                            self.status = 'paused'
-                            LOG.info('PAUSED: process still running. Ctrl+Alt+F9 resumes capture and typing.')
-                        else:
-                            break
+                        self.active = False
+                        self.clear()
+                        self.status = 'paused'
+                        LOG.info('PAUSED: background app remains running; pending request cancelled locally.')
                     if message.wParam == 1:
                         self.active = not self.active
                         self.clear()
@@ -521,6 +488,10 @@ class App:
 
 
 if __name__ == '__main__':
+    if '--monitor' in sys.argv:
+        from monitor import main
+        main()
+        sys.exit(0)
     listener = None
     if '--debug' in sys.argv:
         events = queue.SimpleQueue()

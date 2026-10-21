@@ -32,5 +32,6 @@ $shortcut.WorkingDirectory = $PSScriptRoot
 $shortcut.Hotkey = 'CTRL+ALT+F8'
 $shortcut.Description = 'Windowless capture and code rehearsal utility'
 $shortcut.Save()
-Write-Host 'Setup complete. Ctrl+Alt+F8 starts the app; Ctrl+Alt+F9 pauses; Ctrl+Alt+F12 exits.'
+& (Join-Path $PSScriptRoot 'enable-startup.ps1')
+Write-Host 'Setup complete. Starts at sign-in paused. Ctrl+Alt+F9 enables/pauses; Ctrl+Alt+F12 pauses/cancels. Use stop.cmd to exit.'
 Write-Host 'No app has been started. Set rehearsal=true in config.json to test without an API call.'
