@@ -18,7 +18,24 @@ PROMPT = ('this is a leet code question and I want you to answer this with no co
           'the standard library. The solution must run without installing anything. '
           'MANDATORY RULE: Do not include ASCII art, decorative text, banners, '
           'or ornamental separators. Return only executable source code; normal '
-          'code characters and required string literals are allowed.')
+          'code characters and required string literals are allowed. '
+          'MANDATORY COMPLETENESS RULE: Return a complete standalone runnable program, '
+          'not just a function definition. Implement the actual general solution and '
+          'preserve the function or class signature shown in the screenshot. Include '
+          'all required imports, helper functions, and data structure definitions. '
+          'For Python, include an if __name__ == "__main__": block that calls the '
+          'solution with every fully readable example input from the screenshot, '
+          'prints each computed result, and checks it against the corresponding '
+          'expected output using assertions. Compare results according to the '
+          'problem rules, including order-independent comparisons when applicable. '
+          'Expected outputs are test expectations only: never substitute them for '
+          'computing the answer or hardcode the solution to the examples. If no '
+          'complete examples are readable, include a small valid demonstration '
+          'input and print its computed result without inventing an expected output. '
+          'The program must produce visible output when run directly in PyCharm '
+          'without requiring interactive input. Keep demonstration code inside the '
+          'main block and keep the solution reusable. Continue to return raw code '
+          'only, without comments, Markdown, prose, or decorative output.')
 
 
 def rectangle(start, end):
@@ -30,21 +47,49 @@ def rectangle(start, end):
 
 
 def extract_code(response):
-    candidates = response.get('candidates', [])
-    if not candidates or candidates[0].get('finishReason') != 'STOP':
+    log = logging.getLogger('quiet-capture')
+    if response.get('status') != 'completed':
+        reason = (response.get('incomplete_details') or {}).get('reason')
+        if reason == 'max_output_tokens':
+            log.error('INCOMPLETE ANSWER: OpenAI reached its output token limit. Partial code rejected.')
+        else:
+            log.error('INCOMPLETE ANSWER: OpenAI did not complete the response. Nothing will be replayed.')
         raise ValueError('No complete answer returned')
-    parts = candidates[0].get('content', {}).get('parts', [])
-    text = ''.join(p.get('text', '') for p in parts if not p.get('thought')).strip()
+    texts = []
+    for item in response.get('output', []):
+        if item.get('type') != 'message':
+            continue
+        if item.get('status') != 'completed':
+            raise ValueError('Incomplete output message')
+        for part in item.get('content', []):
+            if part.get('type') == 'refusal':
+                log.error('ANSWER REFUSED: no code will be replayed.')
+                raise ValueError('Response refused')
+            if part.get('type') == 'output_text':
+                texts.append(part.get('text', ''))
+    text = ''.join(texts).strip()
     if text.startswith('```'):
         lines = text.splitlines()
         if len(lines) < 3 or lines[-1].strip() != '```':
             raise ValueError('Incomplete code fence')
         text = '\n'.join(lines[1:-1])
-    if not text or len(text) > 100000:
-        raise ValueError('Empty or oversized response')
+    if not text:
+        raise ValueError('Empty response')
     text = text.replace('\r\n', '\n').replace('\r', '\n').expandtabs(4)
     if any(ord(c) < 32 and c != '\n' for c in text):
         raise ValueError('Unexpected control characters')
+    return text
+
+
+def validate_source(text, language):
+    if language.strip().lower().startswith('python'):
+        try:
+            compile(text, '<generated-answer>', 'exec')
+        except (SyntaxError, ValueError, OverflowError) as error:
+            logging.getLogger('quiet-capture').error(
+                'INVALID PYTHON: syntax validation failed (%s, line %s). Answer rejected before replay.',
+                type(error).__name__, getattr(error, 'lineno', '?'))
+            raise ValueError('Generated Python failed syntax validation') from None
     return text
 
 
@@ -67,28 +112,18 @@ def api_error_summary(error):
         detail = payload.get('error', {}) if isinstance(payload, dict) else {}
         if not isinstance(detail, dict):
             return result
-        status = detail.get('status')
-        if status in {'INVALID_ARGUMENT', 'UNAUTHENTICATED', 'PERMISSION_DENIED',
-                      'NOT_FOUND', 'RESOURCE_EXHAUSTED', 'INTERNAL', 'UNAVAILABLE',
-                      'DEADLINE_EXCEEDED', 'FAILED_PRECONDITION'}:
-            result.append('Provider status: ' + status)
-        details = detail.get('details', [])
-        for item in details if isinstance(details, list) else []:
-            if not isinstance(item, dict):
-                continue
-            kind = item.get('@type')
-            if kind == 'type.googleapis.com/google.rpc.QuotaFailure':
-                result.append('Provider explicitly reported a quota violation.')
-            elif kind == 'type.googleapis.com/google.rpc.RetryInfo':
-                delay = item.get('retryDelay', '')
-                if isinstance(delay, str) and re.fullmatch(r'[0-9]{1,9}(?:\.[0-9]{1,9})?s', delay):
-                    result.append('Provider suggested retry delay: ' + delay + ' (no automatic retry).')
-            elif kind == 'type.googleapis.com/google.rpc.ErrorInfo':
-                reason = item.get('reason')
-                if reason in {'API_KEY_INVALID', 'API_KEY_EXPIRED', 'API_KEY_SERVICE_BLOCKED',
-                              'SERVICE_DISABLED', 'BILLING_DISABLED', 'RATE_LIMIT_EXCEEDED',
-                              'QUOTA_EXCEEDED', 'CONSUMER_INVALID'}:
-                    result.append('Provider reason: ' + reason)
+        code = detail.get('code')
+        hints_by_code = {
+            'insufficient_quota': 'OpenAI quota/billing limit reached; check API credits and project limits.',
+            'rate_limit_exceeded': 'OpenAI request/token rate limit reached; wait before retrying.',
+            'invalid_api_key': 'OpenAI API key is invalid.',
+            'model_not_found': 'Model unavailable or your project lacks access.',
+            'context_length_exceeded': 'Input exceeds this model context limit.'}
+        if code in hints_by_code:
+            result.append(hints_by_code[code])
+        retry = error.headers.get('Retry-After', '') if error.headers else ''
+        if re.fullmatch(r'[0-9]{1,9}(?:\.[0-9]{1,9})?', retry):
+            result.append('Suggested retry delay: ' + retry + ' seconds (no automatic retry).')
     except Exception:
         result.append('Structured error details unavailable; HTTP status above is still valid.')
     finally:
@@ -158,25 +193,28 @@ class RequestControl:
 def generate(png, key, model, language, control=None):
     if not re.fullmatch(r'[A-Za-z0-9._-]+', model):
         raise ValueError('Invalid model ID')
-    payload = {'contents': [{'parts': [
-        {'text': PROMPT + '\nUse ' + language + '. Return raw source code without Markdown fences.'},
-        {'inline_data': {'mime_type': 'image/png', 'data': base64.b64encode(png).decode('ascii')}}
-    ]}]}
+    payload = {'model': model, 'store': False,
+               'instructions': PROMPT + '\nUse ' + language + '. Return raw source code without Markdown fences.',
+               'input': [{'role': 'user', 'content': [
+                   {'type': 'input_text', 'text': 'Solve the problem in this screenshot.'},
+                   {'type': 'input_image', 'detail': 'high',
+                    'image_url': 'data:image/png;base64,' + base64.b64encode(png).decode('ascii')}
+               ]}]}
     body = json.dumps(payload).encode('utf-8')
     if len(body) >= 19000000:
         raise ValueError('Capture too large for inline request')
     request = urllib.request.Request(
-        'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent',
-        data=body, headers={'Content-Type': 'application/json', 'x-goog-api-key': key}, method='POST')
+        'https://api.openai.com/v1/responses',
+        data=body, headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key}, method='POST')
     log = logging.getLogger('quiet-capture')
     started = time.monotonic()
-    log.info('Opening Gemini HTTPS request (%s bytes); awaiting response headers. No app timeout; waiting for server response or connection failure.', len(body))
+    log.info('Opening OpenAI HTTPS request (%s bytes); awaiting response headers. No app timeout; waiting for server response or connection failure.', len(body))
     opened = control.open(request) if control else urllib.request.urlopen(request, timeout=None)
     with opened as response:
         log.info('Response headers received after %.1fs; reading response body.', time.monotonic() - started)
         data = json.load(response)
         log.info('Response body received after %.1fs; validating answer.', time.monotonic() - started)
-        return extract_code(data)
+        return validate_source(extract_code(data), language)
 
 
 class Buffer:
@@ -200,3 +238,6 @@ class Buffer:
 
     def advance(self):
         self.index = min(self.index + 1, len(self.text))
+
+    def rewind(self):
+        self.index = max(0, self.index - 1)

@@ -1,3 +1,4 @@
 @echo off
 cd /d "%~dp0"
-start "" ".venv\Scripts\pythonw.exe" -B "%~dp0app.py"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0launch.ps1" -Action start
+if errorlevel 1 pause

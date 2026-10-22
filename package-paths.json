@@ -1,0 +1,4 @@
+{
+  "app": "dist/QuietCapture/QuietCapture.exe",
+  "monitor": "dist/QuietCaptureMonitor/QuietCaptureMonitor.exe"
+}

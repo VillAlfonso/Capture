@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import queue
 import sys
+import subprocess
 import threading
 import time
 import urllib.error
@@ -31,7 +32,12 @@ def debug_error(context, error):
     LOG.error('%s: %s at %s', context, type(error).__name__, locations)
 
 
-ROOT = Path(__file__).resolve().parent
+if getattr(sys, 'frozen', False):
+    executable_dir = Path(sys.executable).resolve().parent
+    ROOT = next((folder for folder in (executable_dir, executable_dir.parent, executable_dir.parent.parent)
+                 if (folder / 'config.json').is_file()), executable_dir)
+else:
+    ROOT = Path(__file__).resolve().parent
 U = C.WinDLL('user32', use_last_error=True)
 K = C.WinDLL('kernel32', use_last_error=True)
 P = C.WinDLL('crypt32', use_last_error=True)
@@ -103,9 +109,9 @@ bind(P, 'CryptUnprotectData', W.BOOL, C.POINTER(BLOB), C.c_void_p,
 
 
 def read_key():
-    if os.environ.get('GEMINI_API_KEY'):
-        return os.environ['GEMINI_API_KEY'].strip()
-    data = (ROOT / 'key.dpapi').read_bytes()
+    if os.environ.get('OPENAI_API_KEY'):
+        return os.environ['OPENAI_API_KEY'].strip()
+    data = (ROOT / 'openai-key.dpapi').read_bytes()
     raw = (C.c_ubyte * len(data)).from_buffer_copy(data)
     source, target = BLOB(len(data), raw), BLOB()
     if not P.CryptUnprotectData(C.byref(source), None, None, None, None, 1, C.byref(target)):
@@ -147,6 +153,12 @@ def send_character(char):
                        INPUT(type=1, ki=KI(scan=unit, flags=6))]
     batch = (INPUT * len(events))(*events)
     return U.SendInput(len(events), batch, C.sizeof(INPUT)) == len(events)
+
+
+def send_backspace():
+    events = (INPUT * 2)(INPUT(type=1, ki=KI(vk=8)),
+                         INPUT(type=1, ki=KI(vk=8, flags=2)))
+    return U.SendInput(2, events, C.sizeof(INPUT)) == 2
 
 
 class App:
@@ -239,7 +251,8 @@ class App:
                     self.clear()
                 elif vk not in (16,17,18,91,92,160,161,162,163,164,165):
                     if self.active and self.target == U.GetForegroundWindow():
-                        self.work.put(('type', self.buffer.epoch, (self.target, self.hold_generation)))
+                        action = 'backspace' if vk == 8 else 'type'
+                        self.work.put((action, self.buffer.epoch, (self.target, self.hold_generation)))
             return 1
         return U.CallNextHookEx(None, code, msg, address)
 
@@ -320,7 +333,7 @@ class App:
                 LOG.error('NETWORK TIMEOUT: The connection reported a timeout; this app has no fixed request deadline. Quota/authentication status UNKNOWN.')
             elif isinstance(error, urllib.error.URLError):
                 LOG.error('CONNECTION ERROR: Could not complete HTTPS connection (%s). Check network, proxy, DNS, or TLS. Quota status UNKNOWN.', type(error.reason).__name__)
-            debug_error('Gemini request failed', error)
+            debug_error('OpenAI request failed', error)
             with self.lock:
                 if epoch == self.buffer.epoch:
                     self.status = 'request-error-' + type(error).__name__
@@ -369,18 +382,27 @@ class App:
                             threading.Thread(target=self.request, args=(epoch, self.png, control), daemon=True).start()
                         else:
                             self.status = 'no-capture'
-                elif action == 'type':
-                    self.replay_character(epoch, value)
+                elif action in ('type', 'backspace'):
+                    self.replay_character(epoch, value, backspace=action == 'backspace')
             except Exception as error:
                 debug_error('Worker action failed', error)
                 self.status = 'local-error-' + type(error).__name__
 
-    def replay_character(self, epoch, value):
+    def replay_character(self, epoch, value, backspace=False):
         target, hold_generation = value
         with self.lock:
             if (epoch != self.buffer.epoch or not self.held or not self.active
                     or hold_generation != self.hold_generation
                     or target != self.target or target != U.GetForegroundWindow()):
+                return
+            if backspace:
+                if self.buffer.index > 0:
+                    if send_backspace():
+                        self.buffer.rewind()
+                        self.status = 'ready'
+                        LOG.info('REPLAY BACKSPACE: position %s/%s; next tap retypes the removed character.', self.buffer.index, len(self.buffer.text))
+                    else:
+                        self.status = 'input-blocked'
                 return
             char = self.buffer.peek()
             if char:
@@ -388,6 +410,7 @@ class App:
                     self.buffer.advance()
                     if not self.buffer.peek():
                         self.status = 'finished'
+                        LOG.info('REPLAY COMPLETE: all %s characters sent to the editor. Editor formatting is not verified.', len(self.buffer.text))
                 else:
                     self.status = 'input-blocked'
 
@@ -396,7 +419,8 @@ class App:
         while not stopped.is_set():
             with self.lock:
                 state = dict(pid=os.getpid(), running=True, active=self.active,
-                             status=self.status, busy=self.busy, debug=False, thread_id=self.thread_id)
+                             status=self.status, busy=self.busy, debug=False, thread_id=self.thread_id,
+                             sent=self.buffer.index, total=len(self.buffer.text))
             state['events'] = RECENT_EVENTS.snapshot()
             channel.write(state)
             if self.debug_mode and time.monotonic() - last_report >= 10:
@@ -417,6 +441,7 @@ class App:
         if C.get_last_error() == 183:
             K.CloseHandle(mutex)
             return
+        restart_requested = False
         hooks, hotkeys = [], []
         channel, publisher = None, None
         state_stopped = threading.Event()
@@ -442,7 +467,7 @@ class App:
             LOG.info('HOLD Button 4 and DRAG, then RELEASE to capture; Button 5: send.')
             LOG.info('No selection rectangle appears. Side-button DOWN/UP events will appear here in debug mode.')
             LOG.info('Right Alt + keys in PyCharm: replay.')
-            LOG.info('Ctrl+Alt+F9: enable/pause. Ctrl+Alt+F12: pause and cancel. Use stop.cmd to exit.')
+            LOG.info('Ctrl+Alt+F9: enable/pause. Ctrl+Alt+F12: restart and reload, initially paused. Use stop.cmd to exit.')
             message = W.MSG()
             while True:
                 result = U.GetMessageW(C.byref(message), None, 0, 0)
@@ -455,8 +480,10 @@ class App:
                         self.cancel_pending()
                         self.active = False
                         self.clear()
-                        self.status = 'paused'
-                        LOG.info('PAUSED: background app remains running; pending request cancelled locally.')
+                        self.status = 'restarting'
+                        LOG.info('RESTART REQUESTED: cancelling locally and reloading code/configuration. New instance starts paused.')
+                        restart_requested = True
+                        break
                     if message.wParam == 1:
                         self.active = not self.active
                         self.clear()
@@ -485,9 +512,17 @@ class App:
             self.clear()
             K.CloseHandle(mutex)
             LOG.info('Stopped; input hooks released.')
+        if restart_requested:
+            command = ([sys.executable, '--start-paused'] if getattr(sys, 'frozen', False)
+                       else [str(ROOT / '.venv' / 'Scripts' / 'pythonw.exe'), '-B', str(ROOT / 'app.py'), '--start-paused'])
+            subprocess.Popen(command, cwd=str(ROOT), creationflags=subprocess.CREATE_NO_WINDOW)
 
 
 if __name__ == '__main__':
+    if '--stop' in sys.argv:
+        from stop_app import stop
+        stop()
+        sys.exit(0)
     if '--monitor' in sys.argv:
         from monitor import main
         main()
@@ -507,7 +542,9 @@ if __name__ == '__main__':
         LOG.info('STARTING: Loading config.json...')
         settings = json.loads((ROOT / 'config.json').read_text(encoding='utf-8-sig'))
         LOG.info('Model: %s; rehearsal: %s', settings['model'], settings.get('rehearsal', False))
-        LOG.info('Key available: %s', bool(os.environ.get('GEMINI_API_KEY')) or (ROOT / 'key.dpapi').exists())
+        LOG.info('Key available: %s', bool(os.environ.get('OPENAI_API_KEY')) or (ROOT / 'openai-key.dpapi').exists())
+        if '--start-paused' in sys.argv:
+            settings['start_paused'] = True
         App(settings).run()
     except Exception as error:
         debug_error('Startup/runtime failure (check dependencies and hotkey conflicts)', error)

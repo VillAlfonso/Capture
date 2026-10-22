@@ -75,6 +75,45 @@ class WindowsTests(unittest.TestCase):
             self.assertEqual(self.instance.buffer.index, 2)
             self.assertEqual([c.args[0] for c in send.call_args_list], ['a', 'b'])
 
+    def test_backspace_rewinds_then_retypes_before_continuing(self):
+        self.instance.buffer.accept(self.instance.buffer.epoch, 'el')
+        self.key(0xA5)
+        def tap(vk):
+            self.key(vk)
+            self.key(vk, False)
+            action, epoch, value = self.instance.work.get_nowait()
+            self.instance.replay_character(epoch, value, backspace=action == 'backspace')
+        with patch('app.send_character', return_value=True) as send, patch('app.send_backspace', return_value=True) as erase:
+            tap(8)  # Never erase text before this answer.
+            erase.assert_not_called()
+            tap(81)  # e
+            tap(8)   # remove e; next remains e
+            self.assertEqual(self.instance.buffer.peek(), 'e')
+            tap(81)  # e again
+            tap(81)  # l
+            self.assertEqual(self.instance.status, 'finished')
+            tap(8)  # Can rewind even after exhaustion.
+            self.assertEqual(self.instance.buffer.peek(), 'l')
+            self.assertEqual(self.instance.status, 'ready')
+            self.assertEqual([c.args[0] for c in send.call_args_list], ['e', 'e', 'l'])
+            self.assertEqual(erase.call_count, 2)
+
+    def test_failed_or_stale_backspace_does_not_rewind(self):
+        self.instance.buffer.accept(self.instance.buffer.epoch, 'el')
+        self.instance.buffer.advance()
+        self.key(0xA5)
+        self.key(8)
+        _, epoch, value = self.instance.work.get_nowait()
+        with patch('app.send_backspace', return_value=False) as erase:
+            self.instance.replay_character(epoch, value, backspace=True)
+            self.assertEqual(self.instance.buffer.index, 1)
+            self.key(0xA5, False)
+            self.key(0xA5)
+            erase.reset_mock()
+            self.instance.replay_character(epoch, value, backspace=True)
+            erase.assert_not_called()
+            self.assertEqual(self.instance.buffer.index, 1)
+
     def test_injected_events_do_not_recurse(self):
         self.key(0xA5)
         self.assertEqual(self.key(81, flags=0x10), 77)

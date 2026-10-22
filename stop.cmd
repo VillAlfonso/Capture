@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-".venv\Scripts\python.exe" -B stop_app.py
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0launch.ps1" -Action stop
 if errorlevel 1 pause

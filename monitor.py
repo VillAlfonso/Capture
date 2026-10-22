@@ -13,7 +13,8 @@ def describe(state, now):
     return ('LIVE: capture/typing=' + ('ON' if state['active'] else 'OFF (paused)')
             + '; status=' + state['status']
             + '; request=' + ('PENDING' if state['busy'] else 'NONE')
-            + '; Ctrl+Alt+F9=toggle; Ctrl+Alt+F12=pause/cancel')
+            + '; characters=' + str(state.get('sent', '?')) + '/' + str(state.get('total', '?'))
+            + '; Ctrl+Alt+F9=toggle; Ctrl+Alt+F12=restart')
 
 
 def main():

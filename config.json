@@ -1,5 +1,5 @@
 {
-  "model": "gemini-3.8-flash",
+  "model": "gpt-5.6-terra",
   "language": "Python 3",
   "allowed_processes": [
     "pycharm64.exe",

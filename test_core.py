@@ -6,11 +6,14 @@ import urllib.error
 import socket
 import threading
 from types import SimpleNamespace
-from core import Buffer, extract_code, generate, rectangle, api_error_summary, RequestControl, RequestCancelled
+from core import Buffer, extract_code, generate, rectangle, api_error_summary, RequestControl, RequestCancelled, validate_source
 
 
 def response(text, reason='STOP'):
-    return {'candidates': [{'finishReason': reason, 'content': {'parts': [{'text': text}]}}]}
+    return {'status': 'completed' if reason == 'STOP' else 'incomplete',
+            'incomplete_details': {'reason': 'max_output_tokens'},
+            'output': [{'type': 'message', 'status': 'completed',
+                        'content': [{'type': 'output_text', 'text': text}]}]}
 
 
 class CoreTests(unittest.TestCase):
@@ -38,14 +41,12 @@ class CoreTests(unittest.TestCase):
             control.open(None)
 
     def test_quota_diagnostics_do_not_expose_raw_messages(self):
-        body = {'error': {'status': 'RESOURCE_EXHAUSTED', 'message': 'secret-key screenshot text',
-                         'details': [{'@type': 'type.googleapis.com/google.rpc.QuotaFailure'},
-                                     {'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '12s'}]}}
-        error = urllib.error.HTTPError('https://example.test', 429, 'secret-key', {}, io.BytesIO(json.dumps(body).encode()))
+        body = {'error': {'code': 'insufficient_quota', 'message': 'secret-key screenshot text'}}
+        error = urllib.error.HTTPError('https://example.test', 429, 'secret-key', {'Retry-After': '12'}, io.BytesIO(json.dumps(body).encode()))
         output = ' '.join(api_error_summary(error))
         self.assertIn('HTTP 429', output)
-        self.assertIn('quota violation', output)
-        self.assertIn('12s', output)
+        self.assertIn('quota/billing', output)
+        self.assertIn('12 seconds', output)
         self.assertNotIn('secret-key', output)
         self.assertNotIn('screenshot', output)
 
@@ -55,6 +56,35 @@ class CoreTests(unittest.TestCase):
         self.assertIn('HTTP 503', output)
         self.assertIn('Structured error details unavailable', output)
 
+    def test_complete_long_response_is_not_capped(self):
+        text = 'x=1\n' * 30000
+        self.assertEqual(extract_code(response(text)), text.strip())
+
+    def test_provider_truncation_logs_and_rejects_partial_code(self):
+        with self.assertLogs('quiet-capture', level='ERROR') as logs:
+            with self.assertRaises(ValueError):
+                extract_code(response('partial', 'MAX_TOKENS'))
+        self.assertIn('output token limit', ' '.join(logs.output))
+
+    def test_python_syntax_checked_without_execution(self):
+        text = 'raise RuntimeError("must not execute")'
+        self.assertEqual(validate_source(text, 'Python 3'), text)
+        for invalid in ('def f():\n    a=1\n        b=2', 'x = [1,2', 'return 1'):
+            with self.assertLogs('quiet-capture', level='ERROR'):
+                with self.assertRaises(ValueError):
+                    validate_source(invalid, 'Python 3')
+        self.assertEqual(validate_source('int main() {}', 'C++'), 'int main() {}')
+
+    def test_refusal_and_incomplete_messages_rejected(self):
+        data = response('x=1')
+        data['output'][0]['content'] = [{'type': 'refusal', 'refusal': 'No'}]
+        with self.assertRaises(ValueError):
+            extract_code(data)
+        data = response('x=1')
+        data['output'][0]['status'] = 'incomplete'
+        with self.assertRaises(ValueError):
+            extract_code(data)
+
     def test_reverse_drag_and_negative_monitor_coordinates(self):
         self.assertEqual(rectangle((100, 80), (-400, -100)), (-400, -100, 100, 80))
         with self.assertRaises(ValueError):
@@ -62,7 +92,7 @@ class CoreTests(unittest.TestCase):
 
     def test_fences_indentation_and_thoughts(self):
         data = response('```python\ndef f():\n\treturn 1\n```')
-        data['candidates'][0]['content']['parts'].insert(0, {'thought': True, 'text': 'private reasoning'})
+        data['output'].insert(0, {'type': 'reasoning', 'summary': []})
         self.assertEqual(extract_code(data), 'def f():\n    return 1')
 
     def test_incomplete_or_blocked_response_is_never_typed(self):
@@ -95,9 +125,11 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(call.call_args.kwargs['timeout'])
         request = call.call_args.args[0]
         self.assertNotIn('test-secret', request.full_url)
-        self.assertEqual(request.get_header('X-goog-api-key'), 'test-secret')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer test-secret')
+        self.assertEqual(request.full_url, 'https://api.openai.com/v1/responses')
         payload = json.loads(request.data)
-        self.assertEqual(payload['contents'][0]['parts'][1]['inline_data']['data'], 'cG5n')
+        self.assertFalse(payload['store'])
+        self.assertEqual(payload['input'][0]['content'][1]['image_url'], 'data:image/png;base64,cG5n')
 
 
 if __name__ == '__main__':
