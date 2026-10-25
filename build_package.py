@@ -4,21 +4,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from PIL import Image
 
 root = Path(__file__).resolve().parent
 app_name = os.environ.get('QUIET_CAPTURE_APP_NAME', 'QuietCapture')
 monitor_name = os.environ.get('QUIET_CAPTURE_MONITOR_NAME', 'QuietCaptureMonitor')
 assets = root / 'build' / 'branding'
 assets.mkdir(parents=True, exist_ok=True)
-icon = assets / 'quiet-capture.ico'
-icon_args = []
-if (root / 'icon.png').is_file():
-    with Image.open(root / 'icon.png') as picture:
-        picture.convert('RGBA').save(icon, format='ICO', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
-    icon_args = ['--icon', str(icon)]
-else:
-    print('icon.png is missing; using the default packager icon.')
+# No embedded icon: allow Windows/Task Manager to select its generic fallback.
+icon_args = ['--icon', 'NONE']
 for name, source, console, description in (
     (app_name, 'app.py', False, app_name + ' background capture utility'),
     (monitor_name, 'monitor.py', True, monitor_name + ' status monitor'),

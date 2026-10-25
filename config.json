@@ -6,5 +6,9 @@
     "pycharm.exe"
   ],
   "rehearsal": false,
-  "start_paused": true
+  "start_paused": true,
+  "debug_save_answer": true,
+  "debug_trace_replay": true,
+  "temporary_wifi_profile": "MAKATI",
+  "pycharm_tab_replay": true
 }

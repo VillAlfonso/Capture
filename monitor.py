@@ -1,11 +1,12 @@
 """Read-only status monitor. Never starts capture, registers hotkeys, or owns the app."""
 import time
 from runtime_state import StateChannel
+from branding import APP_NAME, MONITOR_NAME
 
 
 def describe(state, now):
     if not state:
-        return 'NOT RUNNING / NO STATUS: use start.cmd or sign in to Windows. Monitor keeps waiting.'
+        return f'NOT RUNNING / NO STATUS: open {APP_NAME}.exe (or start.cmd for a source installation). Monitor keeps waiting.'
     if not state.get('running'):
         return 'STOPPED: monitor keeps waiting for the next launch.'
     if now - state.get('heartbeat', 0) > 3:
@@ -18,6 +19,7 @@ def describe(state, now):
 
 
 def main():
+    print(MONITOR_NAME, flush=True)
     print('MONITOR ONLY: closing this window leaves the background app running.', flush=True)
     channel = StateChannel()
     previous, last_report = None, 0

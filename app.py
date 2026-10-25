@@ -15,6 +15,7 @@ import time
 import urllib.error
 
 from runtime_state import StateChannel, RecentEvents
+from branding import APP_NAME
 
 from core import Buffer, generate, rectangle, api_error_summary, RequestControl, RequestCancelled
 
@@ -32,7 +33,9 @@ def debug_error(context, error):
     LOG.error('%s: %s at %s', context, type(error).__name__, locations)
 
 
-if getattr(sys, 'frozen', False):
+if os.environ.get('QUIET_CAPTURE_PORTABLE_DATA'):
+    ROOT = Path(os.environ['QUIET_CAPTURE_PORTABLE_DATA'])
+elif getattr(sys, 'frozen', False):
     executable_dir = Path(sys.executable).resolve().parent
     ROOT = next((folder for folder in (executable_dir, executable_dir.parent, executable_dir.parent.parent)
                  if (folder / 'config.json').is_file()), executable_dir)
@@ -161,7 +164,38 @@ def send_backspace():
     return U.SendInput(2, events, C.sizeof(INPUT)) == 2
 
 
+def send_key(vk):
+    events = (INPUT * 2)(INPUT(type=1, ki=KI(vk=vk)),
+                         INPUT(type=1, ki=KI(vk=vk, flags=2)))
+    return U.SendInput(2, events, C.sizeof(INPUT)) == 2
+
+
+def select_and_delete(vk):
+    # Delete, not Backspace: on an empty last line this must not join lines.
+    events = (INPUT * 4)(INPUT(type=1, ki=KI(vk=16)),
+                        INPUT(type=1, ki=KI(vk=vk)),
+                        INPUT(type=1, ki=KI(vk=vk, flags=2)),
+                        INPUT(type=1, ki=KI(vk=16, flags=2)))
+    accepted = U.SendInput(4, events, C.sizeof(INPUT)) == 4
+    if not accepted:
+        release = INPUT(type=1, ki=KI(vk=16, flags=2))
+        U.SendInput(1, C.byref(release), C.sizeof(INPUT))
+        return False
+    return send_key(46)
+
+
 class App:
+    def trace_replay(self, event, **fields):
+        if not self.config.get('debug_trace_replay', False):
+            return
+        record = dict(time=time.time(), event=event, position=self.buffer.index,
+                      total=len(self.buffer.text), epoch=self.buffer.epoch, **fields)
+        try:
+            with (ROOT / 'debug-replay.jsonl').open('a', encoding='utf-8') as trace:
+                trace.write(json.dumps(record) + '\n')
+        except OSError:
+            LOG.warning('Could not write temporary replay trace.')
+
     @property
     def status(self):
         return self._status
@@ -213,6 +247,8 @@ class App:
                     break
         if control:
             control.cancel()
+            if getattr(control, 'temporary_wifi', None):
+                control.temporary_wifi.close()
             LOG.info('CANCELLED LOCALLY: connection closed; pending actions discarded. Server-side cancellation is not guaranteed.')
         else:
             LOG.info('Pending actions cleared; no active request.')
@@ -230,11 +266,13 @@ class App:
                 self.held = bool(self.target)
                 if self.held:
                     self.hold_generation += 1
+                    self.trace_replay('hold-start')
                     LOG.info('REPLAY RESUMED: next character %s of %s.', self.buffer.index + 1, len(self.buffer.text))
             elif not down and self.held:
                 self.held = False
                 self.hold_generation += 1
                 self.target = 0
+                self.trace_replay('hold-end')
                 LOG.info('REPLAY PAUSED: position %s/%s saved. Hold Right Alt again to continue.', self.buffer.index, len(self.buffer.text))
                 return 1
             if self.held:
@@ -252,6 +290,7 @@ class App:
                 elif vk not in (16,17,18,91,92,160,161,162,163,164,165):
                     if self.active and self.target == U.GetForegroundWindow():
                         action = 'backspace' if vk == 8 else 'type'
+                        self.trace_replay('tap-queued', virtual_key=vk, action=action)
                         self.work.put((action, self.buffer.epoch, (self.target, self.hold_generation)))
             return 1
         return U.CallNextHookEx(None, code, msg, address)
@@ -292,6 +331,7 @@ class App:
     def request(self, epoch, png, control):
         started = time.monotonic()
         done = threading.Event()
+        wifi = None
 
         def progress():
             while not done.wait(10):
@@ -302,14 +342,28 @@ class App:
         if LOG.isEnabledFor(logging.INFO):
             threading.Thread(target=progress, daemon=True).start()
         try:
+            if self.config.get('temporary_wifi_profile'):
+                from temporary_wifi import TemporaryWifi
+                wifi = TemporaryWifi(self.config['temporary_wifi_profile'], control)
+                control.temporary_wifi = wifi
+                wifi.prepare()
             LOG.info('Loading API key locally.')
             key = read_key()
             LOG.info('API key loaded; preparing request.')
             control.check()
             result = generate(png, key, self.config['model'], self.config['language'], control)
+            if wifi:
+                wifi.close()
             control.check()
             with self.lock:
                 if self.buffer.accept(epoch, result):
+                    if self.config.get('debug_save_answer', False):
+                        try:
+                            answer_path = ROOT / 'debug-last-answer.txt'
+                            answer_path.write_bytes(result.encode('utf-8'))
+                            LOG.info('DIAGNOSTIC: saved validated pre-replay answer to %s (%s characters). Previous answer overwritten.', answer_path, len(result))
+                        except OSError as error:
+                            LOG.warning('DIAGNOSTIC: could not save answer (%s). Replay remains available.', type(error).__name__)
                     self.status = 'ready'
                     LOG.info('Answer ready after %.1fs (%s characters).', time.monotonic() - started, len(result))
                 else:
@@ -338,6 +392,8 @@ class App:
                 if epoch == self.buffer.epoch:
                     self.status = 'request-error-' + type(error).__name__
         finally:
+            if wifi:
+                wifi.close()
             done.set()
             LOG.info('Request ended after %.1fs.', time.monotonic() - started)
             with self.lock:
@@ -394,25 +450,99 @@ class App:
             if (epoch != self.buffer.epoch or not self.held or not self.active
                     or hold_generation != self.hold_generation
                     or target != self.target or target != U.GetForegroundWindow()):
+                self.trace_replay('tap-discarded', action='backspace' if backspace else 'type', queued_epoch=epoch, queued_hold=hold_generation)
                 return
             if backspace:
                 if self.buffer.index > 0:
-                    if send_backspace():
+                    if (select_and_delete(37) if self.config.get('pycharm_tab_replay', False) else send_backspace()):
                         self.buffer.rewind()
+                        self.trace_replay('backspace-accepted')
                         self.status = 'ready'
                         LOG.info('REPLAY BACKSPACE: position %s/%s; next tap retypes the removed character.', self.buffer.index, len(self.buffer.text))
                     else:
                         self.status = 'input-blocked'
                 return
+            if self.config.get('pycharm_tab_replay', False):
+                self.replay_pycharm(epoch, target, hold_generation)
+                return
             char = self.buffer.peek()
             if char:
                 if send_character(char):
+                    self.trace_replay('character-accepted', codepoint=ord(char))
                     self.buffer.advance()
                     if not self.buffer.peek():
                         self.status = 'finished'
                         LOG.info('REPLAY COMPLETE: all %s characters sent to the editor. Editor formatting is not verified.', len(self.buffer.text))
                 else:
+                    self.trace_replay('character-rejected', codepoint=ord(char))
                     self.status = 'input-blocked'
+            else:
+                self.trace_replay('tap-after-end')
+
+    def replay_pycharm(self, epoch, target, generation):
+        """Append-only replay into an empty editor; Tab must expand to four spaces."""
+        start = self.buffer.index
+        text = self.buffer.text
+        if start >= len(text):
+            self.trace_replay('tap-after-end')
+            return
+
+        def check_context():
+            if (not self.held or not self.active or self.buffer.epoch != epoch
+                    or generation != self.hold_generation or target != U.GetForegroundWindow()):
+                raise RuntimeError('Replay context changed during indentation')
+
+        def require(accepted):
+            if not accepted:
+                raise RuntimeError('Input sequence was not fully accepted')
+
+        index = start
+        try:
+            if text[index] == '\n':
+                require(send_character('\n'))
+                index += 1
+                # Allow the editor to handle Enter before selecting its indentation.
+                time.sleep(0.05)
+                check_context()
+                require(select_and_delete(36))  # Shift+Home, Delete
+                column = 0
+            else:
+                line_start = text.rfind('\n', 0, index) + 1
+                prefix = text[line_start:index]
+                if text[index] != ' ' or prefix.strip():
+                    require(send_character(text[index]))
+                    index += 1
+                    column = None
+                else:
+                    column = len(prefix)
+            if column is not None:
+                end = index
+                while end < len(text) and text[end] == ' ':
+                    end += 1
+                while index < end:
+                    check_context()
+                    width = 4 - column % 4
+                    if end - index >= width:
+                        require(send_key(9))
+                        index += width
+                        column += width
+                    else:
+                        require(send_character(' '))
+                        index += 1
+                        column += 1
+            self.buffer.index = index
+            self.trace_replay('pycharm-action-accepted', start=start, end=index)
+            if index == len(text):
+                self.status = 'finished'
+                LOG.info('REPLAY SENT: all %s source characters processed; editor text is not verified.', len(text))
+        except RuntimeError:
+            # Never automatically retry a partially sent compound operation.
+            self.active = False
+            self.held = False
+            self.hold_generation += 1
+            self.status = 'replay-uncertain'
+            self.trace_replay('pycharm-action-interrupted', start=start, attempted_end=index)
+            LOG.error('REPLAY PAUSED: indentation/input sequence interrupted. Clear the editor and start a fresh capture before retrying.')
 
     def publish_state(self, channel, stopped):
         last_report = time.monotonic()
@@ -515,7 +645,11 @@ class App:
         if restart_requested:
             command = ([sys.executable, '--start-paused'] if getattr(sys, 'frozen', False)
                        else [str(ROOT / '.venv' / 'Scripts' / 'pythonw.exe'), '-B', str(ROOT / 'app.py'), '--start-paused'])
-            subprocess.Popen(command, cwd=str(ROOT), creationflags=subprocess.CREATE_NO_WINDOW)
+            restart_environment = os.environ.copy()
+            if getattr(sys, 'frozen', False):
+                restart_environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+            subprocess.Popen(command, cwd=str(ROOT), creationflags=subprocess.CREATE_NO_WINDOW,
+                             env=restart_environment)
 
 
 if __name__ == '__main__':
@@ -536,7 +670,7 @@ if __name__ == '__main__':
         LOG.setLevel(logging.INFO)
         listener = QueueListener(events, handler)
         listener.start()
-        LOG.info('STARTING: Python loaded; initializing Quiet Capture.')
+        LOG.info('STARTING: Python loaded; initializing %s.', APP_NAME)
         LOG.info('Temporary debug console enabled. No key, screenshot, or answer content is logged.')
     try:
         LOG.info('STARTING: Loading config.json...')

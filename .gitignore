@@ -12,6 +12,8 @@ __pycache__/
 .pytest_cache/
 status.txt
 startup-error.txt
+debug-last-answer.txt
+debug-replay.jsonl
 *.log
 
 # Generated executable bundles

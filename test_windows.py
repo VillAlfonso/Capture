@@ -119,6 +119,20 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual(self.key(81, flags=0x10), 77)
         self.assertTrue(self.instance.work.empty())
 
+    def test_rejected_last_character_does_not_finish(self):
+        self.instance.buffer.accept(self.instance.buffer.epoch, 'z')
+        self.key(0xA5)
+        value = (self.instance.target, self.instance.hold_generation)
+        with patch('app.send_character', return_value=False), patch.object(self.instance, 'trace_replay') as trace:
+            self.instance.replay_character(self.instance.buffer.epoch, value)
+            self.assertEqual(self.instance.buffer.index, 0)
+            self.assertEqual(self.instance.status, 'input-blocked')
+            trace.assert_called_with('character-rejected', codepoint=ord('z'))
+        with patch('app.send_character', return_value=True):
+            self.instance.replay_character(self.instance.buffer.epoch, value)
+            self.assertEqual(self.instance.buffer.index, 1)
+            self.assertEqual(self.instance.status, 'finished')
+
     def test_focus_change_stops_queue(self):
         self.key(0xA5)
         app.U.GetForegroundWindow.return_value = 456
@@ -151,6 +165,58 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual(batches[0], [(0, 97, 4), (0, 97, 6)])
         self.assertEqual(batches[1], [(13, 0, 0), (13, 0, 2)])
         self.assertEqual(len(batches[2]), 4)
+
+    def test_tab_replay_handles_nested_dedents_and_blank_lines(self):
+        self.instance.config['pycharm_tab_replay'] = True
+        source = 'def f():\n    if True:\n        pass\n    return 1\n\nprint(f())'
+        self.instance.buffer.accept(self.instance.buffer.epoch, source)
+        self.key(0xA5)
+        editor = ['']
+
+        def character(char):
+            if char == '\n':
+                line = editor[-1]
+                editor.append(line[:len(line) - len(line.lstrip())])
+            else:
+                editor[-1] += char
+            return True
+
+        def key(vk):
+            self.assertEqual(vk, 9)
+            editor[-1] += ' ' * (4 - len(editor[-1]) % 4)
+            return True
+
+        def clear(vk):
+            self.assertEqual(vk, 36)
+            self.assertFalse(editor[-1].strip())
+            editor[-1] = ''
+            return True
+
+        with patch('app.send_character', side_effect=character), patch('app.send_key', side_effect=key), patch('app.select_and_delete', side_effect=clear), patch('app.time.sleep'):
+            while self.instance.buffer.peek():
+                self.instance.replay_character(self.instance.buffer.epoch, (123, self.instance.hold_generation))
+        self.assertEqual('\n'.join(editor), source)
+        self.assertEqual(self.instance.status, 'finished')
+
+    def test_tab_replay_failed_cleanup_pauses_without_retry(self):
+        self.instance.config['pycharm_tab_replay'] = True
+        self.instance.buffer.accept(self.instance.buffer.epoch, '\n    x')
+        self.key(0xA5)
+        with patch('app.send_character', return_value=True), patch('app.select_and_delete', return_value=False), patch('app.time.sleep'):
+            self.instance.replay_character(self.instance.buffer.epoch, (123, self.instance.hold_generation))
+        self.assertFalse(self.instance.active)
+        self.assertEqual(self.instance.status, 'replay-uncertain')
+        self.assertEqual(self.instance.buffer.index, 0)
+
+    def test_tab_replay_backspace_deletes_one_source_character(self):
+        self.instance.config['pycharm_tab_replay'] = True
+        self.instance.buffer.accept(self.instance.buffer.epoch, '    x')
+        self.instance.buffer.index = 4
+        self.key(0xA5)
+        with patch('app.select_and_delete', return_value=True) as delete:
+            self.instance.replay_character(self.instance.buffer.epoch, (123, self.instance.hold_generation), backspace=True)
+        delete.assert_called_once_with(37)
+        self.assertEqual(self.instance.buffer.index, 3)
 
 
 if __name__ == '__main__':
